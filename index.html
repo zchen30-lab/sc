@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>Groundhog Opera — Swipe Rhythm</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f16;overflow:hidden}
+  canvas{display:block;touch-action:none}
+  /* simple UI pill for hints */
+  #hint{
+    position:fixed;left:50%;transform:translateX(-50%);
+    bottom:16px;background:rgba(0,0,0,.55);color:#fff;
+    padding:10px 14px;border-radius:12px;font:600 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    letter-spacing:.2px;backdrop-filter: blur(6px);
+    box-shadow: 0 8px 32px rgba(0,0,0,.35);
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="hint">Swipe to the beat: ↑ ↓ ← → • Perfect timing = music, wrong = scream</div>
+
+<script>
+(() => {
+  // ===== Canvas & DPI =====
+  const cvs = document.getElementById('stage');
+  const ctx = cvs.getContext('2d');
+  const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  let W=0,H=0;
+  function resize(){
+    W = innerWidth|0; H = innerHeight|0;
+    cvs.width = (W*DPR)|0; cvs.height = (H*DPR)|0;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  addEventListener('resize', resize, {passive:true}); resize();
+
+  // ===== Simple PRNG for sparkles =====
+  const R = (()=>{let s=1234567; return ()=> (s=(s*16807)%2147483647)/2147483647})();
+
+  // ===== WebAudio: pretty tones & scream =====
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const actx = new AudioCtx();
+  let audioUnlocked = false;
+  function unlockAudio(){
+    if(audioUnlocked) return;
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.connect(g); g.connect(actx.destination);
+    g.gain.value=0; o.start(); o.stop(actx.currentTime+.03);
+    audioUnlocked = true;
+  }
+  window.addEventListener('pointerdown', unlockAudio, {once:true});
+  window.addEventListener('touchstart', unlockAudio, {once:true});
+
+  function now(){ return actx.currentTime; }
+
+  function tone(freq=440, dur=0.25, type='triangle', vol=0.15){
+    const t0 = now();
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = type; o.frequency.value = freq;
+    o.connect(g); g.connect(actx.destination);
+    const a = {attack:0.01, decay:0.08, sustain:0.55, release:0.12};
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(vol, t0+a.attack);
+    g.gain.linearRampToValueAtTime(vol*a.sustain, t0+a.attack+a.decay);
+    g.gain.setValueAtTime(vol*a.sustain, t0+dur);
+    g.gain.linearRampToValueAtTime(0, t0+dur+a.release);
+    o.start(t0); o.stop(t0+dur+a.release+0.02);
+  }
+
+  function chord(freqs=[440,550,660], dur=.35){
+    freqs.forEach(f => tone(f, dur, 'sine', 0.12));
+  }
+
+  function scream(){
+    const t0 = now();
+    // Sweep + noise burst
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type='sawtooth';
+    o.frequency.setValueAtTime(900, t0);
+    o.frequency.exponentialRampToValueAtTime(1400, t0+.12);
+    o.frequency.exponentialRampToValueAtTime(300, t0+.35);
+
+    // noise
+    const buffer = actx.createBuffer(1, actx.sampleRate*.25, actx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for(let i=0;i<data.length;i++) data[i]=(Math.random()*2-1)*Math.pow(1-i/data.length, 1.2);
+    const ns = actx.createBufferSource(); ns.buffer=buffer;
+    const ng = actx.createGain(); ng.gain.value=.18;
+
+    o.connect(g); g.connect(actx.destination);
+    ns.connect(ng); ng.connect(actx.destination);
+
+    g.gain.value=.0;
+    g.gain.linearRampToValueAtTime(.18, t0+.02);
+    g.gain.exponentialRampToValueAtTime(.001, t0+.45);
+
+    o.start(t0); o.stop(t0+.5);
+    ns.start(t0); ns.stop(t0+.25);
+  }
+
+  // ===== Game timeline =====
+  // Directions: 'U','D','L','R'
+  // Map each to a musical note (A minor-ish)
+  const NOTE = { U: 523.25, // C5
+                 D: 440.00, // A4
+                 L: 659.25, // E5
+                 R: 587.33  // D5
+               };
+
+  // A short looping phrase
+  const bpm = 88;
+  const beat = 60/bpm; // seconds per beat
+  // Sequence in beats (relative); each item -> shows an arrow and expects that swipe at that time
+  const seq = [
+    {t:0, d:'U'},{t:1, d:'D'},{t:2, d:'L'},{t:3, d:'R'},
+    {t:4, d:'U'},{t:4.5, d:'U'},{t:5, d:'L'},{t:6, d:'R'},
+    {t:7, d:'D'},{t:8, d:'L'},{t:9, d:'R'},{t:10, d:'U'},
+  ];
+  // Duplicate with offset to keep it flowing
+  function makeLoop(offsetBeats){
+    return seq.map(s=>({t:s.t+offsetBeats, d:s.d}));
+  }
+  let chart = [...makeLoop(0), ...makeLoop(12), ...makeLoop(24)];
+  const chartLenBeats = 36; // total beats before recycling
+
+  // Visual arrow objects spawned ahead of time
+  const arrows = [];
+  const spawnAhead = 4.5; // beats to travel from spawn to hit line
+  let songStart = actx.currentTime + .6; // allow a moment before first notes
+
+  // ===== Groundhog choir state =====
+  const hogs = [
+    {x:0, y:0, mouth:0, blink:0, vib:0},
+    {x:0, y:0, mouth:0, blink:0, vib:0},
+    {x:0, y:0, mouth:0, blink:0, vib:0},
+    {x:0, y:0, mouth:0, blink:0, vib:0},
+  ];
+  function singPulse(intensity=1){
+    hogs.forEach(h=>{
+      h.mouth = Math.min(1, h.mouth + 0.35*intensity);
+      h.vib = 0.6*intensity;
+    });
+  }
+  function winFlash(){
+    // sparkle burst
+    for(let i=0;i<18;i++){
+      sparkles.push({
+        x: W*0.5 + (R()-0.5)*W*0.6,
+        y: H*0.35 + (R()-0.5)*H*0.3,
+        r: 2+R()*4, a: 1, vx:(R()-0.5)*40, vy:-30-R()*60
+      });
+    }
+  }
+
+  // ===== Visual layout =====
+  const hitY = () => H*0.78;
+  const staffY = () => H*0.86;
+
+  // Lanes positions (for arrow sprites)
+  const lanes = {
+    U: () => W*0.25,
+    D: () => W*0.75,
+    L: () => W*0.40,
+    R: () => W*0.60,
+  };
+
+  // Initialize arrows from chart
+  function scheduleArrows(){
+    arrows.length = 0;
+    chart.forEach(n=>{
+      const appearT = songStart + (n.t - spawnAhead)*beat;
+      const hitT    = songStart +  n.t*beat;
+      const laneX   = lanes[n.d]();
+      arrows.push({
+        d:n.d, appearT, hitT, x:laneX, y:-80, hit:false, judged:false
+      });
+    });
+  }
+  scheduleArrows();
+
+  // ===== Input: swipe detection =====
+  let touchStart = null;
+  function dirFromSwipe(dx, dy, dt){
+    const mag = Math.hypot(dx,dy);
+    if(mag < 24 || dt>600) return null;
+    const ax = Math.abs(dx), ay = Math.abs(dy);
+    if(ax>ay) return dx>0 ? 'R' : 'L';
+    else return dy>0 ? 'D' : 'U';
+  }
+
+  function handleSwipe(dir){
+    if(!dir){ // random poke — punish a little 😈
+      scream(); choirScream();
+      return;
+    }
+    // find nearest pending arrow within timing window
+    const t = now();
+    let best = null, bestErr = 9e9, windowSec = 0.35; // generous
+    for(const a of arrows){
+      if(a.hit || a.judged) continue;
+      const err = Math.abs(a.hitT - t);
+      if(err < windowSec){
+        if(!best || err < bestErr){ best=a; bestErr=err; }
+      }
+    }
+    if(best && best.d === dir){
+      best.hit = true; best.judged = true;
+      // pretty note (or mini chord for emphasis)
+      tone(NOTE[dir], 0.28, 'triangle', 0.18);
+      singPulse(1);
+      winFlash();
+    }else{
+      // wrong lane or no arrow in window
+      scream(); choirScream();
+      if(best && !best.hit) best.judged = true; // mark as judged (miss)
+    }
+  }
+
+  function choirScream(){
+    hogs.forEach(h=>{
+      h.mouth = 1.2;
+      h.vib = 1.2;
+    });
+    // little red exclamation sparks
+    for(let i=0;i<12;i++){
+      sparkles.push({x:W*(0.35+R()*0.3), y:H*(0.32+R()*0.2),
+                     r:2+R()*3, a:1, vx:(R()-0.5)*120, vy:(R()-0.8)*140, red:true});
+    }
+  }
+
+  let startX=0,startY=0,startT=0;
+  cvs.addEventListener('pointerdown', e=>{
+    const r = cvs.getBoundingClientRect();
+    startX = (e.clientX - r.left);
+    startY = (e.clientY - r.top);
+    startT = performance.now();
+  }, {passive:true});
+  cvs.addEventListener('pointerup', e=>{
+    const r = cvs.getBoundingClientRect();
+    const dx = (e.clientX - r.left) - startX;
+    const dy = (e.clientY - r.top) - startY;
+    const dt = performance.now() - startT;
+    handleSwipe(dirFromSwipe(dx,dy,dt));
+  }, {passive:true});
+
+  // ===== Drawing helpers =====
+  function roundRect(x,y,w,h,r){ ctx.beginPath();
+    const rr = Math.min(r, w/2, h/2);
+    ctx.moveTo(x+rr,y);
+    ctx.arcTo(x+w,y,x+w,y+h,rr);
+    ctx.arcTo(x+w,y+h,x,y+h,rr);
+    ctx.arcTo(x,y+h,x,y,rr);
+    ctx.arcTo(x,y,x+w,y,rr);
+    ctx.closePath();
+  }
+
+  function drawCurtains(){
+    // deep red curtains & spotlight gradient
+    const g = ctx.createLinearGradient(0,0,0,H*0.5);
+    g.addColorStop(0,'#260000');
+    g.addColorStop(1,'#5b0e0e');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H*0.42);
+    // arch
+    ctx.fillStyle = '#3b0a0a';
+    ctx.beginPath();
+    ctx.ellipse(W/2, H*0.42, W*0.52, H*0.22, 0, Math.PI, 0, true);
+    ctx.fill();
+    // side curtains
+    ctx.fillStyle = '#7a1111';
+    roundRect(-8,0,W*0.18,H*0.58,14); ctx.fill();
+    roundRect(W*(1-0.18)+8,0,W*0.18,H*0.58,14); ctx.fill();
+    // chandelier glow
+    const cg = ctx.createRadialGradient(W/2,H*0.15,4, W/2,H*0.15, W*0.3);
+    cg.addColorStop(0,'rgba(255,240,180,.85)');
+    cg.addColorStop(1,'rgba(255,240,180,0)');
+    ctx.fillStyle=cg; ctx.beginPath(); ctx.arc(W/2,H*0.15,W*0.3,0,Math.PI*2); ctx.fill();
+  }
+
+  function drawStage(){
+    // stage wood
+    const g = ctx.createLinearGradient(0,H*0.42,0,H*0.62);
+    g.addColorStop(0,'#2b1a08');
+    g.addColorStop(1,'#4a2a0f');
+    ctx.fillStyle = g; ctx.fillRect(0,H*0.42,W,H*0.22);
+    // footlights
+    for(let i=0;i<8;i++){
+      const x = W*(0.1 + i*0.1);
+      const y = H*0.63;
+      ctx.fillStyle='#111'; roundRect(x-18,y-6,36,12,6); ctx.fill();
+      const lg = ctx.createRadialGradient(x,y,2, x,y,18);
+      lg.addColorStop(0,'rgba(255,240,200,.95)');
+      lg.addColorStop(1,'rgba(255,240,200,0)');
+      ctx.fillStyle=lg; ctx.beginPath(); ctx.arc(x,y,28,0,Math.PI*2); ctx.fill();
+    }
+    // orchestra pit
+    ctx.fillStyle = '#0a0f14'; ctx.fillRect(0,H*0.64,W,H*0.06);
+  }
+
+  function drawGroundhog(h, x, y, scale=1){
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.scale(scale, scale);
+    // wobble from singing/screaming
+    const t = performance.now()/1000;
+    const vib = h.vib; h.vib = Math.max(0, h.vib - 0.02);
+    ctx.translate(Math.sin(t*20)*vib*2, Math.cos(t*22)*vib*2);
+
+    // body
+    ctx.fillStyle = '#8b5e34';
+    roundRect(-38, -56, 76, 92, 20); ctx.fill();
+    // belly
+    ctx.fillStyle = '#cfa778';
+    roundRect(-26, -6, 52, 40, 14); ctx.fill();
+
+    // ears
+    ctx.fillStyle = '#7a4f2b';
+    ctx.beginPath(); ctx.arc(-20,-58,10,0,Math.PI*2); ctx.arc(20,-58,10,0,Math.PI*2); ctx.fill();
+
+    // eyes (blink)
+    h.blink = (h.blink<=0 && Math.random()<0.01)? (10+Math.random()*10) : Math.max(0, h.blink-1);
+    const eyeOpen = h.blink>0 ? 0.2 : 1;
+    ctx.fillStyle = '#111';
+    roundRect(-16,-28,10,8*eyeOpen,4); ctx.fill();
+    roundRect(  6,-28,10,8*eyeOpen,4); ctx.fill();
+    // tooth
+    ctx.fillStyle='#eee'; roundRect(-6, -2, 12, 8, 2); ctx.fill();
+
+    // mouth
+    h.mouth = Math.max(0, h.mouth - 0.05);
+    const m = 6 + h.mouth*12;
+    ctx.fillStyle = '#300';
+    ctx.beginPath();
+    ctx.ellipse(0,-10, 12, m, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // little bowtie (opera charm)
+    ctx.fillStyle = '#b0123f';
+    ctx.beginPath();
+    ctx.moveTo(-10,6); ctx.lineTo(0,0); ctx.lineTo(10,6);
+    ctx.lineTo(0,12); ctx.closePath(); ctx.fill();
+
+    ctx.restore();
+  }
+
+  // ===== Sparkles for success & screams =====
+  const sparkles = [];
+  function updateSparkles(dt){
+    for(const s of sparkles){
+      s.x += (s.vx||0)*dt;
+      s.y += (s.vy||0)*dt + 30*dt;
+      s.a -= 0.9*dt;
+    }
+    for(let i=sparkles.length-1;i>=0;i--) if(sparkles[i].a<=0) sparkles.splice(i,1);
+  }
+  function drawSparkles(){
+    for(const s of sparkles){
+      ctx.globalAlpha = Math.max(0, s.a);
+      ctx.fillStyle = s.red ? '#ff3b30' : '#ffe082';
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // ===== Arrows =====
+  function drawArrow(d, x, y, size, glow=false){
+    ctx.save(); ctx.translate(x,y);
+    if(d==='U') ctx.rotate(-Math.PI/2);
+    if(d==='D') ctx.rotate(Math.PI/2);
+    if(d==='L') ctx.rotate(Math.PI);
+    const w=size, h=size*0.65;
+
+    if(glow){
+      const g = ctx.createRadialGradient(0,0,2, 0,0, w*0.8);
+      g.addColorStop(0,'rgba(0,210,255,.9)');
+      g.addColorStop(1,'rgba(0,210,255,0)');
+      ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,w,0,Math.PI*2); ctx.fill();
+    }
+    ctx.fillStyle='#00d2ff';
+    ctx.beginPath();
+    ctx.moveTo(-h*0.45, -w*0.25);
+    ctx.lineTo(h*0.25, -w*0.25);
+    ctx.lineTo(h*0.25, -w*0.45);
+    ctx.lineTo(h*0.75, 0);
+    ctx.lineTo(h*0.25, w*0.45);
+    ctx.lineTo(h*0.25, w*0.25);
+    ctx.lineTo(-h*0.45, w*0.25);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // ===== Decorative staff lines =====
+  function drawStaff(){
+    const y0 = staffY();
+    ctx.strokeStyle = 'rgba(255,255,255,.9)';
+    ctx.lineWidth = 2;
+    for(let i=0;i<5;i++){
+      const yy = y0 + i*10;
+      ctx.beginPath(); ctx.moveTo(W*0.06, yy); ctx.lineTo(W*0.94, yy); ctx.stroke();
+    }
+    // tiny treble clef-ish swirl
+    ctx.save();
+    ctx.translate(W*0.08, y0);
+    ctx.strokeStyle='rgba(255,255,255,.9)'; ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(0,20);
+    ctx.bezierCurveTo(10,-6, -8,-8, -4,10);
+    ctx.bezierCurveTo(6,26, 20,26, 16,10);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ===== Main loop =====
+  let last = performance.now()/1000;
+  function tick(){
+    requestAnimationFrame(tick);
+    const t = performance.now()/1000, dt = Math.min(0.033, t-last); last=t;
+
+    // Background
+    ctx.clearRect(0,0,W,H);
+    // Opera house
+    drawCurtains(); drawStage();
+
+    // Choir positions
+    const baseY = H*0.50;
+    const xs = [W*0.28, W*0.42, W*0.58, W*0.72];
+    for(let i=0;i<hogs.length;i++){
+      hogs[i].x = xs[i]; hogs[i].y = baseY + ((i%2)?6:-6);
+      drawGroundhog(hogs[i], hogs[i].x, hogs[i].y, Math.min(1.3, W/430));
+    }
+
+    // Hit line
+    ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 3;
+    ctx.setLineDash([10,10]); ctx.beginPath(); ctx.moveTo(W*0.1, hitY()); ctx.lineTo(W*0.9, hitY()); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Spawn/update arrows
+    const aNow = now();
+    for(const a of arrows){
+      // travel progress 0..1 from appearT to hitT
+      const prog = (aNow - a.appearT) / (a.hitT - a.appearT);
+      const clamped = Math.max(0, prog);
+      a.y = H*0.08 + (hitY()-H*0.08) * clamped;
+      const glow = Math.abs(a.hitT - aNow) < 0.18;
+      drawArrow(a.d, a.x, a.y, Math.min(54, W/9), glow);
+
+      // auto-judge miss slightly after window
+      if(!a.judged && aNow > a.hitT + 0.45){
+        a.judged = true; // silently miss (no scream on auto-miss)
+      }
+
+      // auto-play melody on time (so correct swipes sound aligned)
+      // We only trigger the nice tone once at the exact hit moment, independent of player's swipe;
+      // Player swipe correctness adds chorus/sparkles and avoids screams.
+      if(!a._played && aNow >= a.hitT){
+        a._played = true;
+        // low volume guide tone
+        tone(NOTE[a.d], 0.22, 'sine', 0.08);
+        // tiny mouth pulse so they look like they're singing to the track
+        singPulse(0.5);
+      }
+    }
+
+    // Clean arrows that are off-screen far below
+    for(let i=arrows.length-1;i>=0;i--){
+      if(arrows[i].y > H+80) arrows.splice(i,1);
+    }
+    // Refill chart if running low
+    if(arrows.length < 12){
+      const baseBeats = chartLenBeats;
+      chart = [...chart, ...makeLoop(baseBeats)];
+      // push new arrows with new timing baseline
+      const extra = makeLoop(baseBeats);
+      const offsetSeconds = baseBeats*beat;
+      extra.forEach(n=>{
+        const appearT = songStart + (n.t - spawnAhead)*beat;
+        const hitT    = songStart +  n.t*beat;
+        arrows.push({d:n.d, appearT, hitT, x:lanes[n.d](), y:-80, hit:false, judged:false});
+      });
+      // increase total for future loops
+      chartLenBeats += 12;
+    }
+
+    // Staff
+    drawStaff();
+
+    // Sparkles
+    updateSparkles(dt); drawSparkles();
+  }
+  tick();
+
+  // Start small intro chord once audio unlocked
+  function intro(){
+    chord([440,554.37,659.25], .5); // A, C#, E (A major-ish for a bright opening)
+    singPulse(1.1);
+  }
+  window.addEventListener('pointerdown', ()=>{ if(!intro._done){intro._done=true; intro();}}, {once:true});
+
+})();
+</script>
+</body>
+</html>
