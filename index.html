@@ -274,6 +274,10 @@
   screamAudio.preload = 'auto';
   screamAudio.volume = 0.7;
 
+  const weirdScreamAudio = new Audio('weird-scream-83171.mp3');
+  weirdScreamAudio.preload = 'auto';
+  weirdScreamAudio.volume = 0.7;
+
   function playCartoonScream(){
     try {
       // Clone and play to allow overlapping sounds
@@ -283,6 +287,18 @@
       sound.play().catch(e => console.log('Audio play failed:', e));
     } catch(e) {
       console.log('Failed to play scream:', e);
+    }
+  }
+
+  function playWeirdScream(){
+    try {
+      // Clone and play to allow overlapping sounds
+      const sound = weirdScreamAudio.cloneNode();
+      sound.volume = 0.6 + Math.random() * 0.2; // Slight volume variation
+      sound.playbackRate = 0.95 + Math.random() * 0.1; // Slight pitch variation
+      sound.play().catch(e => console.log('Audio play failed:', e));
+    } catch(e) {
+      console.log('Failed to play weird scream:', e);
     }
   }
 
@@ -436,7 +452,7 @@
       mole.r += dir*12;
       showBubble("Ouch!", mole.x + dir*60, mole.baseY-140);
       ensureAudio();
-      playCartoonScream(); // Play cartoon scream MP3
+      playWeirdScream(); // Play weird scream MP3 for Adult
     }else if(role===Roles.KID){
       const power = Math.max(0.2, Math.min(1, speed/1500));
       mole.angry = Math.min(1, mole.angry + 0.55);
