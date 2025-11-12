@@ -269,6 +269,23 @@
   let actx=null;
   function ensureAudio(){ if(!actx) actx=new AC(); }
 
+  // ===== Load cartoon scream MP3 =====
+  const screamAudio = new Audio('cartoon-scream-1-6835.mp3');
+  screamAudio.preload = 'auto';
+  screamAudio.volume = 0.7;
+
+  function playCartoonScream(){
+    try {
+      // Clone and play to allow overlapping sounds
+      const sound = screamAudio.cloneNode();
+      sound.volume = 0.6 + Math.random() * 0.2; // Slight volume variation
+      sound.playbackRate = 0.9 + Math.random() * 0.2; // Slight pitch variation
+      sound.play().catch(e => console.log('Audio play failed:', e));
+    } catch(e) {
+      console.log('Failed to play scream:', e);
+    }
+  }
+
   function playScreamStrong(power=1){
     if(!actx) return;
     const t0 = actx.currentTime, dur = 0.35+0.1*power;
@@ -408,7 +425,8 @@
       mole.squish = Math.max(mole.squish, 0.75*power + 0.35);
       mole.sink   = Math.min(1.2, mole.sink + 0.9*power + 0.5);
       showBubble(power>0.6? "Ahhhh!!!":"Ahhh!", mole.x, mole.baseY-140);
-      playScreamStrong(power); screenShakeStrong();
+      playCartoonScream(); // Play cartoon scream MP3
+      screenShakeStrong();
       spawnCracks(mole.x, mole.baseY+14, power);
       spawnDust(mole.x, mole.baseY+6, power);
       spawnShock(mole.x, mole.baseY+6, 420);
@@ -417,7 +435,8 @@
       mole.swayAmp = Math.min(22, mole.swayAmp + 14);
       mole.r += dir*12;
       showBubble("Ouch!", mole.x + dir*60, mole.baseY-140);
-      ensureAudio(); playScreamStrong(0.35);
+      ensureAudio();
+      playCartoonScream(); // Play cartoon scream MP3
     }else if(role===Roles.KID){
       const power = Math.max(0.2, Math.min(1, speed/1500));
       mole.angry = Math.min(1, mole.angry + 0.55);
